@@ -1,1 +1,0 @@
-# MentalHealth-Counselling-System
