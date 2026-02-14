@@ -30,7 +30,7 @@ embeddings = HuggingFaceEmbeddings(
     },
     encode_kwargs={
         'normalize_embeddings': True,
-        'batch_size': 32                     # GPU 可以大
+        'batch_size': 32                     # GPU
     }
 )
 
