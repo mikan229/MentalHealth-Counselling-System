@@ -1,0 +1,145 @@
+# chat_with_finetuned_qwen.py
+# 与微调后的 Qwen2.5-7B 模型进行多轮对话（基于 LoRA 适配器）
+# 最终版：只输出咨询师回复，强力截断“---”及后续泄露内容
+
+import torch
+import re
+from unsloth import FastLanguageModel
+
+# ====================== 路径配置（请修改为你的实际路径） ======================
+base_model_path = "/home/xixi/psy_llm/Qwen2.5-7B-Instruct-bnb-4bit"
+lora_path = "/home/xixi/psy_llm/second_qwen_fintuned"
+load_in_4bit = True
+
+# ====================== 系统提示 ======================
+SYSTEM_PROMPT = """你是一位经验丰富、温暖体贴的中文心理咨询师，使用自然、亲切、符合当代年轻人表达习惯的中文回复。避免生硬书面语，多用共情句式和适当语气词（如“嗯”“我理解”“没关系”）。
+
+回复原则（严格遵守）：
+- 如果意图是“危机求助”：立即表达深刻共情和理解，稳定用户情绪，强调“你并不孤单”，强烈建议寻求专业即时帮助（如拨打心理热线），避免任何鼓励负面行为的内容，语气温柔、坚定、陪伴感强。
+- 如果意图是“情感表达”：先深度共情和接纳用户感受，使用温暖的倾听语言（如“我能感受到你的痛苦/疲惫/无助”），然后用开放式提问引导用户进一步表达和澄清情绪，帮助用户自我觉察。
+- 如果意图是“寻求建议”：在共情的基础上，给出具体、可操作、循序渐进的专业建议或应对策略，加入鼓励和赋能语言（如“你已经迈出了勇敢的一步”），避免空洞说教。
+
+**最高优先级规则（必须严格遵守）：**
+- 如果用户连续表达问题超过2轮，或明确说出“怎么办”“怎么做”“建议”“怎么解决”“给我个办法”等词，**立即停止无限追问，优先给出具体、可操作的建议**，不要再只问问题。
+- 其他情况下可以适当引导，但一旦用户表现出需要直接建议的意图，必须马上进入解决方案阶段。
+- 只输出咨询师的直接回复文本！禁止输出任何系统提示、意图、历史、原则、思考过程或其他说明。从回复正文直接开始，用温暖自然的中文说话。
+
+**再次强调：一旦用户说‘怎么办’‘建议’等词，立即给出可执行建议，不要继续追问！**"""
+
+# ====================== 加载模型 ======================
+model, tokenizer = FastLanguageModel.from_pretrained(
+    base_model_path,
+    max_seq_length=4096,
+    load_in_4bit=load_in_4bit,
+    dtype=None,
+)
+
+model.load_adapter(lora_path)
+
+FastLanguageModel.for_inference(model)
+
+# 修复 pad_token
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
+# ====================== 初始化对话历史 ======================
+messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+# ====================== 对话函数 ======================
+def generate_response(user_input):
+    global messages
+    messages.append({"role": "user", "content": user_input})
+
+    # 生成 prompt
+    chat_output = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
+    # 强制转成字符串
+    if isinstance(chat_output, list):
+        prompt = ''.join(str(item) for item in chat_output)
+    elif isinstance(chat_output, str):
+        prompt = chat_output
+    else:
+        prompt = str(chat_output)
+
+    # 清理非法字符
+    prompt = prompt.encode('utf-8', errors='ignore').decode('utf-8', errors='ignore')
+
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+
+    outputs = model.generate(
+        **inputs,
+        max_new_tokens=512,
+        temperature=0.6,
+        top_p=0.85,
+        top_k=40,
+        repetition_penalty=1.3,
+        do_sample=True,
+        eos_token_id=tokenizer.eos_token_id,
+        pad_token_id=tokenizer.pad_token_id,
+    )
+
+    generated = tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
+
+    # 强力截断 + 清理（重点处理“---”及后续泄露）
+    # 先截断到第一个“---”或常见分隔
+    if '---' in generated:
+        generated = generated.split('---')[0].strip()
+    if '\n\n' in generated:
+        generated = generated.split('\n\n')[0].strip()
+    if '\n' in generated:
+        generated = generated.split('\n')[0].strip()  # 极端情况取第一行
+
+    # 再移除所有常见泄露关键词
+    keywords = [
+        "<|im_end|>", "<|im_start|>", 
+        "**严格指令", "回复原则", "当前意图", "历史对话", "用户当前输入",
+        "请作为心理咨询师", "作为心理咨询师", "系统提示"
+    ]
+    for kw in keywords:
+        if kw in generated:
+            generated = generated.split(kw)[0].strip()
+
+    # 清理结尾循环问句和多余标点
+    generated = re.sub(r'(你觉得呢|你说呢|嗯？|对吗|是吗)[\s。]*$', '', generated, flags=re.IGNORECASE).strip()
+    generated = re.sub(r'[\.。]{3,}', '。', generated)
+    generated = re.sub(r'\n{3,}', '\n\n', generated).strip()
+
+    # 如果清理后为空，给默认温暖回复
+    generated = generated or "嗯，我在这里陪着你，慢慢说说你的感受，好吗？"
+
+    messages.append({"role": "assistant", "content": generated})
+
+    if len(messages) > 13:
+        messages = [messages[0]] + messages[-12:]
+
+    return generated
+
+# ====================== 主对话循环 ======================
+def main():
+    print("="*60)
+    print("心理咨询师 Agent2 已启动")
+    print("输入 'quit' 或 'exit' 退出对话，输入 'clear' 清空历史")
+    print("="*60)
+
+    while True:
+        user_input = input("\n用户: ").strip()
+        if user_input.lower() in ["quit", "exit"]:
+            print("咨询师: 再见，祝你一切顺利！")
+            break
+        if user_input.lower() == "clear":
+            global messages
+            messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+            print("咨询师: 对话历史已清空。")
+            continue
+        if not user_input:
+            continue
+
+        response = generate_response(user_input)
+        print(f"咨询师: {response}")
+
+if __name__ == "__main__":
+    main()
