@@ -1,0 +1,71 @@
+# eval_cmmlu_manual_base.py   
+#未微调基线qwen在CMMLU上的测试脚本
+import csv
+import os
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from tqdm import tqdm
+
+# 路径配置
+BASE_MODEL = "/home/xixi/psy_llm/Qwen2.5-7B-Instruct-bnb-4bit"
+DATA_DIR = "/home/xixi/psy_llm/memory_datasets/cmmlu_v1_0_1/test"   # 你的 test CSV 文件夹
+LIMIT = 100  # 每个子任务最多评测 100 条（可改大或删掉）
+
+# 加载基础模型和 tokenizer（不加载 LoRA）
+tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
+model = AutoModelForCausalLM.from_pretrained(
+    BASE_MODEL,
+    device_map="auto",
+    torch_dtype="auto"
+)
+model.eval()
+
+# 选项映射
+OPTIONS = ['A', 'B', 'C', 'D']
+
+def generate_answer(question, choices):
+    prompt = f"Question: {question}\n" + "\n".join([f"{opt}. {choices[opt]}" for opt in OPTIONS]) + "\nAnswer:"
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=1,
+            do_sample=False,           # greedy 解码
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id
+        )
+    answer = tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True).strip().upper()
+    return answer[0] if answer and answer[0] in OPTIONS else ""
+
+# 加载所有 CSV 并评测
+total_correct = 0
+total_questions = 0
+
+csv_files = [f for f in os.listdir(DATA_DIR) if f.endswith('.csv')]
+for csv_file in tqdm(csv_files):  # 如果太慢，可改成 csv_files[:5] 先跑 5 个文件测试
+    path = os.path.join(DATA_DIR, csv_file)
+    with open(path, 'r', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for i, row in enumerate(reader):
+            if i >= LIMIT:
+                break
+            # 尝试不同列名（CMMLU CSV 常见变体）
+            question = row.get('question') or row.get('Question') or ''
+            answer = row.get('answer') or row.get('Answer') or ''
+            choices = {
+                'A': row.get('A') or row.get('Option A') or '',
+                'B': row.get('B') or row.get('Option B') or '',
+                'C': row.get('C') or row.get('Option C') or '',
+                'D': row.get('D') or row.get('Option D') or ''
+            }
+            if not question or not answer:
+                continue
+            pred = generate_answer(question, choices)
+            correct = 1 if pred == answer.upper() else 0
+            total_correct += correct
+            total_questions += 1
+
+accuracy = total_correct / total_questions if total_questions > 0 else 0
+print(f"总题数: {total_questions}")
+print(f"正确数: {total_correct}")
+print(f"准确率: {accuracy:.4f} ({accuracy*100:.2f}%)")
